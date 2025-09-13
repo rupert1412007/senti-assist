@@ -1,94 +1,81 @@
+# main.py
 import os
-import requests
-from fastapi import FastAPI
-from pydantic import BaseModel
+import random
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import Optional, Literal, Dict
 
-# Load Azure endpoint and key
-ENDPOINT = os.getenv("AZURE_LANGUAGE_ENDPOINT", "https://senti-service.cognitiveservices.azure.com/")
-API_KEY = os.getenv("AZURE_LANGUAGE_KEY", "7WxSIvGdIRzOSf6mrLXlFxhOoZM5UPLKr8I0Dv1BwFUgw6fDlOxnJQQJ99BIACqBBLyXJ3w3AAAaACOGbl9o")
-PATH = "/language/:analyze-text?api-version=2023-04-01"
+from sentiment_assistant import (
+    analyze_sentiment,
+    classify_tone_and_intent,
+    build_spiel,
+    mask_pii,
+    decide_mode,
+    SentimentResult,
+)
 
-app = FastAPI(title="Sentiment & Tone API")
+app = FastAPI(title="Senti Assist — Empathy & Tone API", version="1.3.0")
 
-class TextInput(BaseModel):
+
+class AnalyzeRequest(BaseModel):
+    text: str = Field(..., min_length=1)
+    customer_name: Optional[str] = None
+    agent_name: Optional[str] = None
+    context: Optional[str] = None
+
+
+class AnalyzeResponse(BaseModel):
     text: str
+    sentiment: Literal["positive", "neutral", "negative"]
+    confidence: Dict[str, float]
+    tone: str
+    intent: Optional[str]
+    mode: Literal["deescalate", "neutral", "upsell"]
+    spiel: str
 
-# --- Azure Sentiment Analysis ---
-def analyze_sentiment(text: str):
-    url = ENDPOINT.rstrip("/") + PATH
-    headers = {
-        "Ocp-Apim-Subscription-Key": API_KEY,
-        "Content-Type": "application/json"
-    }
-    body = {
-        "kind": "SentimentAnalysis",
-        "parameters": {"opinionMining": False},
-        "analysisInput": {
-            "documents": [{"id": "1", "language": "en", "text": text}]
-        }
-    }
 
-    response = requests.post(url, headers=headers, json=body)
-    if response.status_code != 200:
-        raise Exception(f"Azure request failed: {response.status_code}, {response.text}")
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "service": "senti-assist"}
 
-    result = response.json()
-    doc = result["results"]["documents"][0]
-    return doc["sentiment"]
 
-# --- Tone Classifier ---
-def classify_tone(text: str, sentiment: str):
-    t = text.lower()
+@app.post("/analyze", response_model=AnalyzeResponse)
+def analyze(req: AnalyzeRequest):
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="Empty text.")
 
-    if sentiment == "negative":
-        if any(word in t for word in ["angry", "furious", "upset", "mad"]):
-            return "angry"
-        if any(word in t for word in ["tired", "waiting", "slow", "delay"]):
-            return "frustrated"
-        if any(word in t for word in ["don’t understand", "don't understand", "confused", "unclear", "why"]):
-            return "confused"
-        if any(word in t for word in ["not happy", "bad", "poor", "unhappy"]):
-            return "upset"
-        return "negative"
-    
-    if sentiment == "positive":
-        if any(word in t for word in ["thank", "glad", "great", "happy"]):
-            return "happy"
-        if any(word in t for word in ["fine", "good", "satisfied", "okay now"]):
-            return "satisfied"
-        return "positive"
-    
-    if sentiment == "neutral":
-        if "not sure" in t or "maybe" in t:
-            return "uncertain"
-        return "neutral"
+    # 1) sanitize
+    clean_text = mask_pii(req.text)
 
-    return sentiment
+    # 2) Azure Sentiment
+    senti: SentimentResult = analyze_sentiment(clean_text)
 
-# --- Spiel Generator ---
-def get_spiel(sentiment: str, tone: str):
-    spiels = {
-        "angry": "I understand your frustration. Let’s work together to fix this immediately.",
-        "frustrated": "I get that this has been frustrating. I’ll make sure to simplify things for you.",
-        "confused": "I see this is confusing. Let me clarify and guide you step by step.",
-        "upset": "I’m sorry you’re experiencing this. I’ll do my best to resolve it quickly.",
-        "happy": "I’m glad to hear that! By the way, would you like to hear about some new services we offer?",
-        "satisfied": "I’m happy things are working fine. Is there anything else I can do for you?",
-        "neutral": "Thank you for sharing. Let’s continue and see how I can assist further.",
-        "uncertain": "I’ll take a closer look at this and make sure we get clarity."
-    }
-    return spiels.get(tone, "Thank you for reaching out. I’ll do my best to assist you.")
+    # 3) Tone + intent
+    tone, intent = classify_tone_and_intent(clean_text, senti.label)
 
-# --- API Endpoint ---
-@app.post("/analyze")
-def analyze(input: TextInput):
-    sentiment = analyze_sentiment(input.text)
-    tone = classify_tone(input.text, sentiment)
-    spiel = get_spiel(sentiment, tone)
+    # 4) Decide mode (deescalate / neutral / upsell)
+    mode = decide_mode(senti.label, senti.confidence)
 
-    return {
-        "text": input.text,
-        "sentiment": sentiment,
-        "tone": tone,
-        "spiel": spiel
-    }
+    # 5) Humanized spiel
+    spiel = build_spiel(
+        sentiment=senti.label,
+        tone=tone,
+        intent=intent,
+        customer_name=req.customer_name,
+        agent_name=req.agent_name,
+        context=req.context,
+        confidence=senti.confidence,
+        mode=mode,
+        variety_seed=random.random(),
+    )
+
+    return AnalyzeResponse(
+        text=req.text,
+        sentiment=senti.label,
+        confidence=senti.confidence,
+        tone=tone,
+        intent=intent,
+        mode=mode,
+        spiel=spiel,
+    )
+
